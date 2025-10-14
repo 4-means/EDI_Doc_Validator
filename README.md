@@ -35,6 +35,8 @@ python x12_validator.py \
 - `--ignore-file` — CSV of ignore rules (see `O856_X12_config.csv` for format)
 - `--tx` — force transaction/message type (e.g., `856`, `863`, `DESADV`, `QALITY`, or aliases such as `ASN`, `QUALITY`)
 
+The tool validates that both files use the same EDI format and transaction/message type. Provide `--tx` only when you intentionally need to override auto-detection.
+
 ## Examples
 Generate an 863 comparison with custom delimiters:
 ```bash

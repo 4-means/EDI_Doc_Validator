@@ -1396,13 +1396,35 @@ def build_report(pattern_path: str, test_path: str, out_path: str,
     p_parsed = parse_segments(pattern_segments, pattern_elem_sep, pattern_meta["release_character"])
     t_parsed = parse_segments(test_segments, test_elem_sep, test_meta["release_character"])
 
-    tx_type = normalize_tx_type((tx or "").strip(), edi_format)
-    if not tx_type:
-        detected = detect_tx_type(p_parsed, format_hint=edi_format)
-        tx_type = normalize_tx_type(detected, edi_format)
+    requested_tx = normalize_tx_type((tx or "").strip(), edi_format) if tx else None
+
+    pattern_detected_raw = detect_tx_type(p_parsed, format_hint=edi_format)
+    test_detected_raw = detect_tx_type(t_parsed, format_hint=edi_format)
+    pattern_detected = normalize_tx_type(pattern_detected_raw, edi_format) if pattern_detected_raw else None
+    test_detected = normalize_tx_type(test_detected_raw, edi_format) if test_detected_raw else None
+
+    if requested_tx:
+        tx_type = requested_tx
+    else:
+        if pattern_detected:
+            tx_type = pattern_detected
+        elif test_detected:
+            tx_type = test_detected
+        elif edi_format == EDI_FORMAT_X12:
+            tx_type = "856"
+        else:
+            tx_type = None
 
     if not tx_type:
-        raise ValueError("Unable to auto-detect transaction/message type. Provide --tx to continue.")
+        source = "ST01 segments" if edi_format == EDI_FORMAT_X12 else "UNH segments"
+        raise ValueError(f"Unable to auto-detect transaction/message type from {source}. Provide --tx to continue.")
+
+    if pattern_detected and pattern_detected != tx_type:
+        raise ValueError(f"Transaction type mismatch: pattern file indicates '{pattern_detected_raw}' (normalized to '{pattern_detected}') "
+                         f"which differs from expected '{tx_type}'. Use --tx to override if intentional.")
+    if test_detected and test_detected != tx_type:
+        raise ValueError(f"Transaction type mismatch: test file indicates '{test_detected_raw}' (normalized to '{test_detected}') "
+                         f"which differs from expected '{tx_type}'.")
 
     # Pattern/Test Elements (always emit)
     pattern_elem_values = flatten_elements_for_sheet(p_parsed, "pattern")
