@@ -443,7 +443,9 @@ def key_for_segment_856(seg: Dict[str, Any]) -> Tuple:
     if tag == "TD5":
         return ("TD5", (e[1] if len(e) > 1 else "") or "")
     if tag == "PRF":
-        return ("PRF", (e[1] if len(e) > 1 else "") or "")
+        return ("PRF", "__ANY__")
+    if tag == "PID":
+        return ("PID", tuple(e[1:]))
     if tag == "LIN":
         return ("LIN",)
     return (tag,)
