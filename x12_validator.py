@@ -8,24 +8,156 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
+EDI_FORMAT_X12 = "X12"
+EDI_FORMAT_EDIFACT = "EDIFACT"
+
+
+def detect_edi_format(raw: str) -> str:
+    stripped = raw.lstrip()
+    if stripped.startswith("UNA") or stripped.startswith("UNB"):
+        return EDI_FORMAT_EDIFACT
+    return EDI_FORMAT_X12
+
+
+def parse_una(raw: str) -> Dict[str, Optional[str]]:
+    idx = raw.find("UNA")
+    if idx == -1:
+        return {
+            "component_separator": ":",
+            "element_separator": "+",
+            "decimal_mark": ".",
+            "release_character": "?",
+            "repetition_separator": None,
+            "segment_terminator": "'"
+        }
+    data = raw[idx + 3: idx + 9]
+    if len(data) < 6:
+        return {
+            "component_separator": ":",
+            "element_separator": "+",
+            "decimal_mark": ".",
+            "release_character": "?",
+            "repetition_separator": None,
+            "segment_terminator": "'"
+        }
+    return {
+        "component_separator": data[0],
+        "element_separator": data[1],
+        "decimal_mark": data[2],
+        "release_character": data[3],
+        "repetition_separator": data[4] if data[4] != " " else None,
+        "segment_terminator": data[5]
+    }
+
+
+def split_segments(raw: str, terminator: str, release: Optional[str] = None) -> List[str]:
+    segments: List[str] = []
+    current: List[str] = []
+    i = 0
+    length = len(raw)
+    while i < length:
+        ch = raw[i]
+        if release and ch == release:
+            i += 1
+            if i < length:
+                current.append(raw[i])
+            i += 1
+            continue
+        if ch == terminator:
+            seg = "".join(current).strip()
+            if seg:
+                segments.append(seg)
+            current = []
+        else:
+            if ch not in ("\r", "\n"):
+                current.append(ch)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def split_elements(segment: str, element_sep: str, release: Optional[str] = None) -> List[str]:
+    if not element_sep:
+        return [segment]
+    elems: List[str] = []
+    current: List[str] = []
+    i = 0
+    length = len(segment)
+    while i < length:
+        ch = segment[i]
+        if release and ch == release:
+            i += 1
+            if i < length:
+                current.append(segment[i])
+            i += 1
+            continue
+        if ch == element_sep:
+            elems.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    elems.append("".join(current))
+    return elems
+
 
 # -------------------------------------------------------
 #  File I/O and parsing
 # -------------------------------------------------------
-def read_x12(path: str, seg_term: str = None) -> Tuple[List[str], str]:
+
+def read_edi_file(path: str,
+                  seg_term: Optional[str] = None,
+                  elem_sep_override: Optional[str] = None) -> Tuple[List[str], Dict[str, Any]]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read()
+    edi_format = detect_edi_format(raw)
+
+    if edi_format == EDI_FORMAT_EDIFACT:
+        una = parse_una(raw)
+        release_char = una.get("release_character")
+        seg_sep = seg_term or una.get("segment_terminator") or "'"
+        element_sep = una.get("element_separator") or "+"
+        component_sep = una.get("component_separator") or ":"
+        repetition_sep = una.get("repetition_separator")
+        segments = split_segments(raw.replace("\r", "").replace("\n", ""), seg_sep, release_char)
+        meta = {
+            "format": edi_format,
+            "segment_terminator": seg_sep,
+            "element_separator": element_sep,
+            "component_separator": component_sep,
+            "release_character": release_char,
+            "repetition_separator": repetition_sep
+        }
+        return segments, meta
+
     guessed = "~" if "~" in raw else None
-    if seg_term is None:
-        seg_term = guessed if guessed else "~"
-    segments = [s.strip() for s in raw.replace("\n", "").split(seg_term) if s.strip()]
-    return segments, seg_term
+    seg_sep = seg_term or guessed or "~"
+    element_sep = elem_sep_override or "*"
+    segments = split_segments(raw.replace("\r", "").replace("\n", ""), seg_sep, None)
+    meta = {
+        "format": edi_format,
+        "segment_terminator": seg_sep,
+        "element_separator": element_sep,
+        "component_separator": None,
+        "release_character": None,
+        "repetition_separator": None
+    }
+    return segments, meta
 
 
-def parse_segments(segments: List[str], element_sep: str = "*") -> List[Dict[str, Any]]:
+def read_x12(path: str, seg_term: str = None) -> Tuple[List[str], str]:
+    segments, meta = read_edi_file(path, seg_term=seg_term, elem_sep_override="*")
+    return segments, meta["segment_terminator"]
+
+
+def parse_segments(segments: List[str],
+                   element_sep: str = "*",
+                   release_char: Optional[str] = None) -> List[Dict[str, Any]]:
     parsed = []
     for idx, seg in enumerate(segments):
-        elems = seg.split(element_sep)
+        elems = split_elements(seg, element_sep, release_char)
         tag = elems[0] if elems else ""
         parsed.append({"index": idx, "tag": tag, "elements": elems})
     return parsed
@@ -34,11 +166,38 @@ def parse_segments(segments: List[str], element_sep: str = "*") -> List[Dict[str
 # -------------------------------------------------------
 #  Detect ST01 (tx type) from the pattern file
 # -------------------------------------------------------
-def detect_tx_type(parsed: List[Dict[str, Any]]) -> Optional[str]:
+def detect_tx_type(parsed: List[Dict[str, Any]], format_hint: Optional[str] = None) -> Optional[str]:
+    if format_hint in (None, EDI_FORMAT_EDIFACT):
+        for rec in parsed:
+            if rec["tag"] == "UNH":
+                if len(rec["elements"]) > 2 and rec["elements"][2]:
+                    return rec["elements"][2].split(":")[0]
     for rec in parsed:
         if rec["tag"] == "ST":
             return rec["elements"][1] if len(rec["elements"]) > 1 else None
     return None
+
+
+def normalize_tx_type(tx_type: Optional[str], format_hint: str) -> Optional[str]:
+    if not tx_type:
+        return None
+    canonical = tx_type.upper()
+    if format_hint == EDI_FORMAT_EDIFACT:
+        mapping = {
+            "ASN": "DESADV",
+            "DESADV": "DESADV",
+            "QUALITY": "QALITY",
+            "QALITY": "QALITY",
+            "QUALITYREPORT": "QALITY"
+        }
+        return mapping.get(canonical, canonical)
+    mapping = {
+        "ASN": "856",
+        "DESADV": "856",
+        "QUALITY": "863",
+        "QALITY": "863"
+    }
+    return mapping.get(canonical, canonical)
 
 
 # -------------------------------------------------------
@@ -1056,52 +1215,194 @@ def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
 
 
 # -------------------------------------------------------
+#  EDIFACT comparator (UNH/UNT aligned)
+# -------------------------------------------------------
+def edifact_header_envelope(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    first_unh = next((i for i, s in enumerate(parsed) if s["tag"] == "UNH"), None)
+    return parsed[0:first_unh] if first_unh is not None else parsed[:]
+
+
+def edifact_trailer_envelope(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    last_unt = None
+    for i, s in enumerate(parsed):
+        if s["tag"] == "UNT":
+            last_unt = i
+    return parsed[last_unt + 1:] if last_unt is not None else []
+
+
+def get_unh_blocks(parsed: List[Dict[str, Any]]) -> List[Tuple[int, int, str, List[Dict[str, Any]]]]:
+    blocks = []
+    for idx, seg in enumerate(parsed):
+        if seg["tag"] != "UNH":
+            continue
+        end = None
+        for j in range(idx + 1, len(parsed)):
+            if parsed[j]["tag"] == "UNT":
+                end = j + 1
+                break
+        if end is None:
+            end = len(parsed)
+        ref = seg["elements"][1] if len(seg["elements"]) > 1 else f"__pos__{len(blocks)}"
+        blocks.append((idx, end, ref, parsed[idx:end]))
+    return blocks
+
+
+def compare_edifact_transactions(tx_type: str,
+                                 p_parsed: List[Dict[str, Any]],
+                                 t_parsed: List[Dict[str, Any]],
+                                 ignore_rules: List[IgnoreRule],
+                                 seg_diff_rows: List[Dict[str, Any]],
+                                 elem_diff_rows: List[Dict[str, Any]],
+                                 missing_rows: List[Dict[str, Any]],
+                                 extra_rows: List[Dict[str, Any]]) -> None:
+    p_env_hdr = edifact_header_envelope(p_parsed)
+    t_env_hdr = edifact_header_envelope(t_parsed)
+    positional_diff(p_env_hdr, t_env_hdr, ignore_rules,
+                    seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+
+    p_blocks = get_unh_blocks(p_parsed)
+    t_blocks = get_unh_blocks(t_parsed)
+
+    p_map = {ref: blk for (_, _, ref, blk) in p_blocks}
+    t_map = {ref: blk for (_, _, ref, blk) in t_blocks}
+
+    keys_in_order: List[str] = []
+    for (_, _, ref, _) in p_blocks:
+        if ref not in keys_in_order:
+            keys_in_order.append(ref)
+    for (_, _, ref, _) in t_blocks:
+        if ref not in keys_in_order:
+            keys_in_order.append(ref)
+
+    for ref in keys_in_order:
+        p_blk = p_map.get(ref)
+        t_blk = t_map.get(ref)
+        if p_blk and t_blk:
+            positional_diff(p_blk, t_blk, ignore_rules,
+                            seg_diff_rows, elem_diff_rows, missing_rows, extra_rows,
+                            line_key=ref, cid_key="")
+        elif p_blk and not t_blk:
+            for seg in p_blk:
+                if seg["tag"] == "UNH":
+                    seg_diff_rows.append({
+                        "op": "DELETE",
+                        "meaning": op_meaning("DELETE"),
+                        "pattern_range": f"{seg['index']}:{seg['index']+1}",
+                        "test_range": f"{seg['index']}:{seg['index']}",
+                        "pattern_tag": seg["tag"],
+                        "test_tag": ""
+                    })
+                missing_rows.append({
+                    "pattern_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+        elif t_blk and not p_blk:
+            for seg in t_blk:
+                if seg["tag"] == "UNH":
+                    seg_diff_rows.append({
+                        "op": "INSERT",
+                        "meaning": op_meaning("INSERT"),
+                        "pattern_range": f"{seg['index']}:{seg['index']}",
+                        "test_range": f"{seg['index']}:{seg['index']+1}",
+                        "pattern_tag": "",
+                        "test_tag": seg["tag"]
+                    })
+                extra_rows.append({
+                    "test_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+
+    p_env_trl = edifact_trailer_envelope(p_parsed)
+    t_env_trl = edifact_trailer_envelope(t_parsed)
+    positional_diff(p_env_trl, t_env_trl, ignore_rules,
+                    seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+
+
+# -------------------------------------------------------
 #  Report builder
 # -------------------------------------------------------
-def extract_env(parsed):
+def extract_env(parsed: List[Dict[str, Any]], edi_format: str) -> Dict[str, str]:
     d = {}
     tags = {p["tag"]: p for p in parsed}
-    isa = tags.get("ISA"); gs = tags.get("GS"); st = tags.get("ST")
-    se = tags.get("SE"); ge = tags.get("GE"); iea = tags.get("IEA")
-    if isa:
-        d["ISA_ControlVersion"] = isa["elements"][12] if len(isa["elements"]) > 12 else ""
-        d["ISA_ControlNumber"] = isa["elements"][13] if len(isa["elements"]) > 13 else ""
-        d["ISA_UsageIndicator"] = isa["elements"][15] if len(isa["elements"]) > 15 else ""
-    if gs:
-        d["GS_FunctionalID"] = gs["elements"][1] if len(gs["elements"]) > 1 else ""
-        d["GS_Version"] = gs["elements"][8] if len(gs["elements"]) > 8 else ""
-        d["GS_GroupControl"] = gs["elements"][6] if len(gs["elements"]) > 6 else ""
-    if st:
-        d["ST_SetID"] = st["elements"][1] if len(st["elements"]) > 1 else ""
-        d["ST_Control"] = st["elements"][2] if len(st["elements"]) > 2 else ""
-    if se:
-        d["SE_SegmentCount"] = se["elements"][1] if len(se["elements"]) > 1 else ""
-        d["SE_Control"] = se["elements"][2] if len(se["elements"]) > 2 else ""
-    if ge:
-        d["GE_TransactionCount"] = ge["elements"][1] if len(ge["elements"]) > 1 else ""
-        d["GE_GroupControl"] = ge["elements"][2] if len(ge["elements"]) > 2 else ""
-    if iea:
-        d["IEA_GroupCount"] = iea["elements"][1] if len(iea["elements"]) > 1 else ""
-        d["IEA_InterchangeControl"] = iea["elements"][2] if len(iea["elements"]) > 2 else ""
+    if edi_format == EDI_FORMAT_X12:
+        isa = tags.get("ISA"); gs = tags.get("GS"); st = tags.get("ST")
+        se = tags.get("SE"); ge = tags.get("GE"); iea = tags.get("IEA")
+        if isa:
+            d["ISA_ControlVersion"] = isa["elements"][12] if len(isa["elements"]) > 12 else ""
+            d["ISA_ControlNumber"] = isa["elements"][13] if len(isa["elements"]) > 13 else ""
+            d["ISA_UsageIndicator"] = isa["elements"][15] if len(isa["elements"]) > 15 else ""
+        if gs:
+            d["GS_FunctionalID"] = gs["elements"][1] if len(gs["elements"]) > 1 else ""
+            d["GS_Version"] = gs["elements"][8] if len(gs["elements"]) > 8 else ""
+            d["GS_GroupControl"] = gs["elements"][6] if len(gs["elements"]) > 6 else ""
+        if st:
+            d["ST_SetID"] = st["elements"][1] if len(st["elements"]) > 1 else ""
+            d["ST_Control"] = st["elements"][2] if len(st["elements"]) > 2 else ""
+        if se:
+            d["SE_SegmentCount"] = se["elements"][1] if len(se["elements"]) > 1 else ""
+            d["SE_Control"] = se["elements"][2] if len(se["elements"]) > 2 else ""
+        if ge:
+            d["GE_TransactionCount"] = ge["elements"][1] if len(ge["elements"]) > 1 else ""
+            d["GE_GroupControl"] = ge["elements"][2] if len(ge["elements"]) > 2 else ""
+        if iea:
+            d["IEA_GroupCount"] = iea["elements"][1] if len(iea["elements"]) > 1 else ""
+            d["IEA_InterchangeControl"] = iea["elements"][2] if len(iea["elements"]) > 2 else ""
+    else:
+        unb = tags.get("UNB"); unh = tags.get("UNH"); unt = tags.get("UNT"); unz = tags.get("UNZ")
+        if unb:
+            d["UNB_Syntax"] = unb["elements"][1] if len(unb["elements"]) > 1 else ""
+            d["UNB_Sender"] = unb["elements"][2] if len(unb["elements"]) > 2 else ""
+            d["UNB_Recipient"] = unb["elements"][3] if len(unb["elements"]) > 3 else ""
+            d["UNB_DateTime"] = unb["elements"][4] if len(unb["elements"]) > 4 else ""
+            d["UNB_ControlReference"] = unb["elements"][5] if len(unb["elements"]) > 5 else ""
+        if unh:
+            d["UNH_MessageRef"] = unh["elements"][1] if len(unh["elements"]) > 1 else ""
+            if len(unh["elements"]) > 2 and unh["elements"][2]:
+                d["UNH_MessageType"] = unh["elements"][2].split(":")[0]
+            else:
+                d["UNH_MessageType"] = ""
+        if unt:
+            d["UNT_SegmentCount"] = unt["elements"][1] if len(unt["elements"]) > 1 else ""
+            d["UNT_MessageRef"] = unt["elements"][2] if len(unt["elements"]) > 2 else ""
+        if unz:
+            d["UNZ_MessageCount"] = unz["elements"][1] if len(unz["elements"]) > 1 else ""
+            d["UNZ_ControlReference"] = unz["elements"][2] if len(unz["elements"]) > 2 else ""
     return d
 
 
 def build_report(pattern_path: str, test_path: str, out_path: str,
-                 seg_term: str = None, elem_sep: str = "*",
+                 seg_term: Optional[str] = None, elem_sep: Optional[str] = None,
                  ignore_file: Optional[str] = None, tx: Optional[str] = None):
 
     ignore_rules = load_ignore_rules(ignore_file)
 
-    pattern_segments, _ = read_x12(pattern_path, seg_term)
-    test_segments, _ = read_x12(test_path, seg_term)
+    pattern_segments, pattern_meta = read_edi_file(pattern_path, seg_term=seg_term, elem_sep_override=elem_sep)
+    test_segments, test_meta = read_edi_file(test_path, seg_term=seg_term, elem_sep_override=elem_sep)
 
-    p_parsed = parse_segments(pattern_segments, elem_sep)
-    t_parsed = parse_segments(test_segments, elem_sep)
+    if pattern_meta["format"] != test_meta["format"]:
+        raise ValueError("Pattern and test files use different EDI formats (X12 vs EDIFACT).")
 
-    # Auto-detect tx from ST01 if not provided
-    tx_type = (tx or "").strip()
+    edi_format = pattern_meta["format"]
+
+    pattern_elem_sep = pattern_meta["element_separator"]
+    test_elem_sep = test_meta["element_separator"]
+
+    if elem_sep and edi_format == EDI_FORMAT_X12:
+        pattern_elem_sep = elem_sep
+        test_elem_sep = elem_sep
+
+    p_parsed = parse_segments(pattern_segments, pattern_elem_sep, pattern_meta["release_character"])
+    t_parsed = parse_segments(test_segments, test_elem_sep, test_meta["release_character"])
+
+    tx_type = normalize_tx_type((tx or "").strip(), edi_format)
     if not tx_type:
-        tx_type = detect_tx_type(p_parsed) or "856"
+        detected = detect_tx_type(p_parsed, format_hint=edi_format)
+        tx_type = normalize_tx_type(detected, edi_format)
+
+    if not tx_type:
+        raise ValueError("Unable to auto-detect transaction/message type. Provide --tx to continue.")
 
     # Pattern/Test Elements (always emit)
     pattern_elem_values = flatten_elements_for_sheet(p_parsed, "pattern")
@@ -1112,14 +1413,20 @@ def build_report(pattern_path: str, test_path: str, out_path: str,
     extra_rows: List[Dict[str, Any]] = []
     elem_diff_rows: List[Dict[str, Any]] = []
 
-    if tx_type == "856":
-        compare_856_transactions(p_parsed, t_parsed, ignore_rules,
-                                 seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
-    elif tx_type == "863":
-        compare_863_transactions(p_parsed, t_parsed, ignore_rules,
-                                 seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+    if edi_format == EDI_FORMAT_X12:
+        if tx_type == "856":
+            compare_856_transactions(p_parsed, t_parsed, ignore_rules,
+                                     seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+        elif tx_type == "863":
+            compare_863_transactions(p_parsed, t_parsed, ignore_rules,
+                                     seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+        else:
+            raise ValueError(f"Unsupported X12 transaction type '{tx_type}'. Supported values: 856, 863.")
+    elif edi_format == EDI_FORMAT_EDIFACT:
+        compare_edifact_transactions(tx_type, p_parsed, t_parsed, ignore_rules,
+                                     seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
     else:
-        raise ValueError(f"Unsupported transaction type '{tx_type}'. Provide --tx or ensure ST01 is 856/863.")
+        raise ValueError(f"Unsupported EDI format '{edi_format}'.")
 
     # Friendly meaning column
     for row in seg_diff_rows:
@@ -1137,8 +1444,8 @@ def build_report(pattern_path: str, test_path: str, out_path: str,
         "delta": t_counts.get(tag, 0) - p_counts.get(tag, 0)
     } for tag in tag_union]
 
-    p_env = extract_env(p_parsed)
-    t_env = extract_env(t_parsed)
+    p_env = extract_env(p_parsed, edi_format)
+    t_env = extract_env(t_parsed, edi_format)
     summary_rows = [{
         "field": k,
         "pattern": p_env.get(k, ""),
@@ -1246,14 +1553,14 @@ def build_report(pattern_path: str, test_path: str, out_path: str,
 #  CLI
 # -------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Compare two X12 documents (856/863) and export differences to Excel.")
-    ap.add_argument("--pattern", required=True, help="Path to the pattern (golden) X12 file")
-    ap.add_argument("--test", required=True, help="Path to the test X12 file")
+    ap = argparse.ArgumentParser(description="Compare two EDI documents (X12 856/863 or EDIFACT DESADV/QALITY) and export differences to Excel.")
+    ap.add_argument("--pattern", required=True, help="Path to the pattern (golden) EDI file")
+    ap.add_argument("--test", required=True, help="Path to the test EDI file")
     ap.add_argument("--out", required=True, help="Output Excel file path")
     ap.add_argument("--seg-term", default=None, help="Segment terminator override (optional)")
-    ap.add_argument("--elem-sep", default="*", help="Element separator override (default: *)")
+    ap.add_argument("--elem-sep", default=None, help="Element separator override (X12 only; default auto-detect)")
     ap.add_argument("--ignore-file", default=None, help="CSV file of ignore rules (optional)")
-    ap.add_argument("--tx", default=None, help="Transaction type (e.g., 856, 863). If omitted, auto-detect from ST01 in the pattern file.")
+    ap.add_argument("--tx", default=None, help="Transaction/message type (e.g., 856, 863, DESADV, QALITY). Auto-detected when possible.")
     args = ap.parse_args()
 
     build_report(args.pattern, args.test, args.out,
