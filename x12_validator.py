@@ -889,13 +889,31 @@ def split_cid_groups(line_block: List[Dict[str, Any]]) -> List[List[Dict[str, An
 
 
 def cid_key_from_group(cid_group: List[Dict[str, Any]]) -> str:
-    for seg in cid_group:
-        if seg["tag"] == "MEA":
-            e = seg["elements"]
-            mea01 = e[1] if len(e) > 1 else ""
-            mea02 = e[2] if len(e) > 2 else ""
-            return f"{mea01}:{mea02}"
-    return "__NO_MEA__"
+    """Return a stable identifier for all CID groups that share the same CID qualifier."""
+    cid_seg = next((s for s in cid_group if s["tag"] == "CID"), None)
+    if not cid_seg:
+        return "__NO_CID__"
+    elems = cid_seg["elements"]
+    cid01 = elems[1] if len(elems) > 1 else ""
+    cid02 = elems[2] if len(elems) > 2 else ""
+    cid03 = elems[3] if len(elems) > 3 else ""
+    return f"{cid01}:{cid02}:{cid03}"
+
+
+def mea_signature(seg: Dict[str, Any]) -> Tuple[str, str, str]:
+    elems = seg["elements"]
+    return (
+        elems[1] if len(elems) > 1 else "",
+        elems[2] if len(elems) > 2 else "",
+        elems[4] if len(elems) > 4 else ""
+    )
+
+
+def cid_group_sort_key(cid_group: List[Dict[str, Any]]) -> Tuple[Tuple[str, str, str], ...]:
+    mea_keys = [mea_signature(seg) for seg in cid_group if seg["tag"] == "MEA"]
+    if not mea_keys:
+        return (('__NO_MEA__', '', ''),)
+    return tuple(sorted(mea_keys))
 
 
 def line_header_region(line_block: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -904,11 +922,13 @@ def line_header_region(line_block: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def line_trailer_region(line_block: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    last_cid = None
-    for i, s in enumerate(line_block):
-        if s["tag"] == "CID":
-            last_cid = i
-    return line_block[last_cid + 1:] if last_cid is not None else []
+    """
+    Original logic returned everything after the last CID, which duplicates MEAs from the
+    final CID group in Element Diff/Missing tabs. There typically are no true "trailer"
+    segments for 863 lines once CID groups start, so we return an empty list to avoid
+    re-processing those segments.
+    """
+    return []
 
 
 def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
@@ -1023,8 +1043,8 @@ def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
                             ordered_cid_keys.append(ck); cseen.add(ck)
 
                     for ck in ordered_cid_keys:
-                        p_groups = p_cmap.get(ck, [])
-                        t_groups = t_cmap.get(ck, [])
+                        p_groups = sorted(p_cmap.get(ck, []), key=cid_group_sort_key)
+                        t_groups = sorted(t_cmap.get(ck, []), key=cid_group_sort_key)
                         m = min(len(p_groups), len(t_groups))
 
                         for gi in range(m):
@@ -1091,10 +1111,9 @@ def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
                                         "segment_text": "*".join(s["elements"])
                                     })
 
-                            # MEA alignment by (MEA01,MEA02)
+                            # MEA alignment by (MEA01,MEA02,MEA04)
                             def mea_key(seg):
-                                e = seg["elements"]
-                                return (e[1] if len(e) > 1 else "", e[2] if len(e) > 2 else "")
+                                return mea_signature(seg)
 
                             p_mea_map = defaultdict(list)
                             t_mea_map = defaultdict(list)
@@ -1105,7 +1124,7 @@ def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
                                 if s["tag"] == "MEA":
                                     t_mea_map[mea_key(s)].append(s)
 
-                            all_mea_keys = list(dict.fromkeys([*p_mea_map.keys(), *t_mea_map.keys()]))
+                            all_mea_keys = sorted(set(p_mea_map.keys()) | set(t_mea_map.keys()))
 
                             for mk in all_mea_keys:
                                 pml = p_mea_map.get(mk, [])
