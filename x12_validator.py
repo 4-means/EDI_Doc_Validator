@@ -486,6 +486,12 @@ def transaction_header_region(block: List[Dict[str, Any]]) -> List[Dict[str, Any
     return block[0:first_hl] if first_hl is not None else block[:]
 
 
+def transaction_header_region_until(block: List[Dict[str, Any]],
+                                    start_tag: str) -> List[Dict[str, Any]]:
+    first = next((i for i, s in enumerate(block) if s["tag"] == start_tag), None)
+    return block[0:first] if first is not None else block[:]
+
+
 def transaction_trailer_region(block: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     start = None
     for i, s in enumerate(block):
@@ -929,6 +935,294 @@ def line_trailer_region(line_block: List[Dict[str, Any]]) -> List[Dict[str, Any]
     re-processing those segments.
     """
     return []
+
+
+def get_rcd_blocks(tx_block: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    starts = [i for i, s in enumerate(tx_block) if s["tag"] == "RCD"]
+    if not starts:
+        return []
+    blocks = []
+    for si, start in enumerate(starts):
+        end = len(tx_block)
+        if si + 1 < len(starts):
+            end = starts[si + 1]
+        else:
+            for j in range(start + 1, len(tx_block)):
+                if tx_block[j]["tag"] in ("CTT", "SE"):
+                    end = j
+                    break
+        blocks.append(tx_block[start:end])
+    return blocks
+
+
+def rcd_block_key(block: List[Dict[str, Any]]) -> str:
+    lin_seg = next((s for s in block if s["tag"] == "LIN"), None)
+    if lin_seg:
+        return lin_line_key(lin_seg["elements"])
+    rcd_seg = block[0] if block else None
+    if not rcd_seg:
+        return "__RCD__"
+    elems = rcd_seg["elements"]
+    if len(elems) > 1:
+        return "RCD:" + "|".join(elems[1:])
+    return f"RCD_INDEX_{rcd_seg['index']}"
+
+
+def compare_rcd_block(p_block: List[Dict[str, Any]],
+                      t_block: List[Dict[str, Any]],
+                      ignore_rules: List[IgnoreRule],
+                      seg_diff_rows: List[Dict[str, Any]],
+                      elem_diff_rows: List[Dict[str, Any]],
+                      missing_rows: List[Dict[str, Any]],
+                      extra_rows: List[Dict[str, Any]],
+                      line_key: str) -> None:
+    if not p_block or not t_block:
+        return
+
+    p_rcd = p_block[0]
+    t_rcd = t_block[0]
+    rows, any_diff = compare_elements(p_rcd, t_rcd, ignore_rules, line_key=line_key, cid_key="")
+    elem_diff_rows.extend(rows)
+    seg_diff_rows.append({
+        "op": "REPLACE" if any_diff else "EQUAL",
+        "meaning": op_meaning("REPLACE" if any_diff else "EQUAL"),
+        "pattern_range": f"{p_rcd['index']}:{p_rcd['index']+1}",
+        "test_range": f"{t_rcd['index']}:{t_rcd['index']+1}",
+        "pattern_tag": p_rcd["tag"],
+        "test_tag": t_rcd["tag"],
+    })
+
+    known_tags = ("LIN", "PID", "REF", "DTM", "MEA")
+    p_known = {tag: [] for tag in known_tags}
+    t_known = {tag: [] for tag in known_tags}
+    p_other: List[Dict[str, Any]] = []
+    t_other: List[Dict[str, Any]] = []
+
+    for seg in p_block[1:]:
+        if seg["tag"] in p_known:
+            p_known[seg["tag"]].append(seg)
+        else:
+            p_other.append(seg)
+    for seg in t_block[1:]:
+        if seg["tag"] in t_known:
+            t_known[seg["tag"]].append(seg)
+        else:
+            t_other.append(seg)
+
+    def align_segments(tag: str, key_fn):
+        p_list = p_known[tag]
+        t_list = t_known[tag]
+        if not p_list and not t_list:
+            return
+
+        p_map = defaultdict(list)
+        t_map = defaultdict(list)
+        p_order: List[Any] = []
+        t_order: List[Any] = []
+
+        for seg in p_list:
+            key = key_fn(seg)
+            p_map[key].append(seg)
+            if key not in p_order:
+                p_order.append(key)
+
+        for seg in t_list:
+            key = key_fn(seg)
+            t_map[key].append(seg)
+            if key not in t_order:
+                t_order.append(key)
+
+        ordered_keys: List[Any] = []
+        seen = set()
+        for key in [*p_order, *t_order]:
+            if key not in seen:
+                ordered_keys.append(key)
+                seen.add(key)
+
+        for key in ordered_keys:
+            pl = p_map.get(key, [])
+            tl = t_map.get(key, [])
+            common = min(len(pl), len(tl))
+            for i in range(common):
+                p_seg = pl[i]
+                t_seg = tl[i]
+                rows, seg_diff = compare_elements(p_seg, t_seg, ignore_rules, line_key=line_key, cid_key="")
+                elem_diff_rows.extend(rows)
+                seg_diff_rows.append({
+                    "op": "REPLACE" if seg_diff else "EQUAL",
+                    "meaning": op_meaning("REPLACE" if seg_diff else "EQUAL"),
+                    "pattern_range": f"{p_seg['index']}:{p_seg['index']+1}",
+                    "test_range": f"{t_seg['index']}:{t_seg['index']+1}",
+                    "pattern_tag": p_seg["tag"],
+                    "test_tag": t_seg["tag"],
+                })
+            for i in range(common, len(pl)):
+                seg = pl[i]
+                missing_rows.append({
+                    "pattern_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+                seg_diff_rows.append({
+                    "op": "DELETE",
+                    "meaning": op_meaning("DELETE"),
+                    "pattern_range": f"{seg['index']}:{seg['index']+1}",
+                    "test_range": f"{seg['index']}:{seg['index']}",
+                    "pattern_tag": seg["tag"],
+                    "test_tag": ""
+                })
+            for i in range(common, len(tl)):
+                seg = tl[i]
+                extra_rows.append({
+                    "test_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+                seg_diff_rows.append({
+                    "op": "INSERT",
+                    "meaning": op_meaning("INSERT"),
+                    "pattern_range": f"{seg['index']}:{seg['index']}",
+                    "test_range": f"{seg['index']}:{seg['index']+1}",
+                    "pattern_tag": "",
+                    "test_tag": seg["tag"]
+                })
+
+    align_segments("LIN", lambda seg: lin_line_key(seg["elements"]))
+    align_segments("PID", lambda seg: tuple(seg["elements"][1:]))
+    align_segments("REF", lambda seg: seg["elements"][1] if len(seg["elements"]) > 1 else "")
+    align_segments("DTM", lambda seg: seg["elements"][1] if len(seg["elements"]) > 1 else "")
+    align_segments("MEA", mea_signature)
+
+    if p_other or t_other:
+        positional_diff(p_other, t_other, ignore_rules,
+                        seg_diff_rows, elem_diff_rows, missing_rows, extra_rows,
+                        line_key=line_key, cid_key="")
+
+
+def compare_861_transactions(p_parsed, t_parsed, ignore_rules,
+                             seg_diff_rows, elem_diff_rows, missing_rows, extra_rows):
+    # Envelope header
+    p_env_hdr = header_envelope(p_parsed)
+    t_env_hdr = header_envelope(t_parsed)
+    positional_diff(p_env_hdr, t_env_hdr, ignore_rules,
+                    seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+
+    # ST blocks paired by ST02
+    p_tx = get_st_blocks(p_parsed)
+    t_tx = get_st_blocks(t_parsed)
+    p_map = {ctrl: blk for (_, _, ctrl, blk) in p_tx}
+    t_map = {ctrl: blk for (_, _, ctrl, blk) in t_tx}
+    keys_in_order = [ctrl for (_, _, ctrl, _) in p_tx]
+    for (_, _, ctrl, _) in t_tx:
+        if ctrl not in keys_in_order:
+            keys_in_order.append(ctrl)
+
+    for ctrl in keys_in_order:
+        p_blk = p_map.get(ctrl)
+        t_blk = t_map.get(ctrl)
+
+        if p_blk and t_blk:
+            # Header up to first RCD — align N1 segments by qualifier
+            p_head = transaction_header_region_until(p_blk, "RCD")
+            t_head = transaction_header_region_until(t_blk, "RCD")
+            compare_region_with_n1_key(p_head, t_head, ignore_rules,
+                                       seg_diff_rows, elem_diff_rows, missing_rows, extra_rows,
+                                       line_key="", cid_key="")
+
+            # Item blocks keyed by LIN identifiers or RCD content
+            p_blocks = get_rcd_blocks(p_blk)
+            t_blocks = get_rcd_blocks(t_blk)
+
+            p_block_map = defaultdict(list)
+            p_block_order: List[str] = []
+            for block in p_blocks:
+                key = rcd_block_key(block)
+                p_block_map[key].append(block)
+                if key not in p_block_order:
+                    p_block_order.append(key)
+
+            t_block_map = defaultdict(list)
+            t_block_order: List[str] = []
+            for block in t_blocks:
+                key = rcd_block_key(block)
+                t_block_map[key].append(block)
+                if key not in t_block_order:
+                    t_block_order.append(key)
+
+            ordered_keys: List[str] = []
+            seen = set()
+            for key in [*p_block_order, *t_block_order]:
+                if key not in seen:
+                    ordered_keys.append(key)
+                    seen.add(key)
+
+            for key in ordered_keys:
+                p_list = p_block_map.get(key, [])
+                t_list = t_block_map.get(key, [])
+                common = min(len(p_list), len(t_list))
+                for i in range(common):
+                    compare_rcd_block(p_list[i], t_list[i], ignore_rules,
+                                      seg_diff_rows, elem_diff_rows, missing_rows, extra_rows,
+                                      line_key=key)
+                for i in range(common, len(p_list)):
+                    for seg in p_list[i]:
+                        missing_rows.append({
+                            "pattern_index": seg["index"],
+                            "segment_tag": seg["tag"],
+                            "segment_text": "*".join(seg["elements"])
+                        })
+                for i in range(common, len(t_list)):
+                    for seg in t_list[i]:
+                        extra_rows.append({
+                            "test_index": seg["index"],
+                            "segment_tag": seg["tag"],
+                            "segment_text": "*".join(seg["elements"])
+                        })
+
+            # Trailer (CTT/SE)
+            p_trl = transaction_trailer_region(p_blk)
+            t_trl = transaction_trailer_region(t_blk)
+            positional_diff(p_trl, t_trl, ignore_rules,
+                            seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+
+        elif p_blk and not t_blk:
+            for seg in p_blk:
+                if seg["tag"] == "ST":
+                    seg_diff_rows.append({
+                        "op": "DELETE",
+                        "meaning": op_meaning("DELETE"),
+                        "pattern_range": f"{seg['index']}:{seg['index']+1}",
+                        "test_range": f"{seg['index']}:{seg['index']}",
+                        "pattern_tag": seg["tag"],
+                        "test_tag": ""
+                    })
+                missing_rows.append({
+                    "pattern_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+        elif t_blk and not p_blk:
+            for seg in t_blk:
+                if seg["tag"] == "ST":
+                    seg_diff_rows.append({
+                        "op": "INSERT",
+                        "meaning": op_meaning("INSERT"),
+                        "pattern_range": f"{seg['index']}:{seg['index']}",
+                        "test_range": f"{seg['index']}:{seg['index']+1}",
+                        "pattern_tag": "",
+                        "test_tag": seg["tag"]
+                    })
+                extra_rows.append({
+                    "test_index": seg["index"],
+                    "segment_tag": seg["tag"],
+                    "segment_text": "*".join(seg["elements"])
+                })
+
+    # Envelope trailer (GE/IEA)
+    p_env_trl = trailer_envelope(p_parsed)
+    t_env_trl = trailer_envelope(t_parsed)
+    positional_diff(p_env_trl, t_env_trl, ignore_rules,
+                    seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
 
 
 def compare_863_transactions(p_parsed, t_parsed, ignore_rules,
@@ -1460,11 +1754,14 @@ def build_report(pattern_path: str, test_path: str, out_path: str,
         if tx_type == "856":
             compare_856_transactions(p_parsed, t_parsed, ignore_rules,
                                      seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
+        elif tx_type == "861":
+            compare_861_transactions(p_parsed, t_parsed, ignore_rules,
+                                     seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
         elif tx_type == "863":
             compare_863_transactions(p_parsed, t_parsed, ignore_rules,
                                      seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)
         else:
-            raise ValueError(f"Unsupported X12 transaction type '{tx_type}'. Supported values: 856, 863.")
+            raise ValueError(f"Unsupported X12 transaction type '{tx_type}'. Supported values: 856, 861, 863.")
     elif edi_format == EDI_FORMAT_EDIFACT:
         compare_edifact_transactions(tx_type, p_parsed, t_parsed, ignore_rules,
                                      seg_diff_rows, elem_diff_rows, missing_rows, extra_rows)

@@ -10,7 +10,7 @@ The generated workbook contains:
 - **Missing Segments** / **Extra Segments** — unmatched segments from each file
 - **Pattern Elements** / **Test Elements** — flattened element values for quick filtering
 
-The validator understands X12 856 (ship notice) and 863 (report of test results) transaction sets, aligning ST blocks by control number and matching HL/LIN loops intelligently. EDIFACT DESADV (ASN) and QALITY (quality report) messages are parsed automatically, with UNH/UNT blocks aligned by message reference. Volatile elements can be skipped through a configurable ignore-rules CSV.
+The validator understands X12 856 (ship notice), 861 (receipt advice), and 863 (report of test results) transaction sets, aligning ST blocks by control number and matching HL/LIN/RCD loops intelligently. EDIFACT DESADV (ASN) and QALITY (quality report) messages are parsed automatically, with UNH/UNT blocks aligned by message reference. Volatile elements can be skipped through a configurable ignore-rules CSV.
 
 ## Requirements
 - Python 3.9+
@@ -46,6 +46,15 @@ python x12_validator.py \
   --out     O863_X12_Comparison.xlsx \
   --seg-term '~' \
   --elem-sep '*'
+```
+
+Compare an 861 receipt advice:
+```bash
+python x12_validator.py \
+  --pattern 861/O861_AK_attern.txt \
+  --test    861/O861_MittalBH_Pattern.txt \
+  --out     861_compare.xlsx \
+  --tx      861
 ```
 
 Run an 856 comparison while ignoring specific qualifier combinations:
